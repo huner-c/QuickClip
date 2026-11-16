@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+temp_raw*.mkv
+dist/
+build/
+*.egg-info/
+bin/
