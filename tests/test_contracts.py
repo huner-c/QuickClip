@@ -22,6 +22,7 @@ from quickclip.contracts import (
     ICaptureEngine,
     IExporterService,
     IHotkeyListener,
+    MonitorInfo,
     TrimRequest,
     TrimResult,
 )
@@ -321,3 +322,27 @@ def test_protocols_runtime_checkable(tmp_path: Path) -> None:
     assert not isinstance(object(), ICaptureEngine)
     assert not isinstance(object(), IExporterService)
     assert not isinstance(object(), IHotkeyListener)
+
+
+def test_monitor_info_contract_and_label() -> None:
+    primary = MonitorInfo(
+        index=1,
+        name="DisplayA",
+        width=3840,
+        height=2160,
+        left=0,
+        top=0,
+        is_primary=True,
+    )
+    secondary = MonitorInfo(
+        index=2,
+        name="",
+        width=1920,
+        height=1080,
+        left=3840,
+        top=0,
+        is_primary=False,
+    )
+    assert quickclip.MonitorInfo is MonitorInfo
+    assert primary.label == "Ekran 1 • DisplayA (3840x2160 • Birincil)"
+    assert secondary.label == "Ekran 2 (1920x1080)"

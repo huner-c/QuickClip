@@ -21,13 +21,16 @@ from quickclip.capture import (
     build_encoder_args,
     clear_encoder_cache,
     list_audio_devices,
+    list_monitors,
     parse_dshow_audio_devices,
     parse_hotkey,
     probe_audio_device,
     resolve_audio_input,
+    resolve_monitor_rect,
 )
+from quickclip.capture.engine import _DXCamGrabber
 from quickclip.capture.hotkey import MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, WM_HOTKEY, WM_QUIT
-from quickclip.contracts import CaptureConfig, CaptureResult, CaptureState, ICaptureEngine, IHotkeyListener
+from quickclip.contracts import CaptureConfig, CaptureResult, CaptureState, ICaptureEngine, IHotkeyListener, MonitorInfo
 
 
 class _SyntheticGrabber:
@@ -931,6 +934,89 @@ def test_bundled_binaries_frozen_exe_dir_priority_and_cache_keying(
     assert any(c[0] == str(frozen_ffmpeg) for c in run_cmds)
     assert any(c[0] == "custom_ffmpeg_bin" for c in run_cmds)
     clear_encoder_cache()
+
+
+def test_list_monitors_and_dxcam_rect_matching() -> None:
+    monitors = list_monitors()
+    assert len(monitors) >= 1
+    assert all(isinstance(m, MonitorInfo) and m.index >= 1 and m.width > 0 and m.height > 0 for m in monitors)
+    rect = resolve_monitor_rect(monitors[0].index)
+    assert rect == (monitors[0].left, monitors[0].top, monitors[0].width, monitors[0].height)
+
+    class _Coords:
+        def __init__(self, left: int, top: int, right: int, bottom: int) -> None:
+            self.left = left
+            self.top = top
+            self.right = right
+            self.bottom = bottom
+
+    class _Desc:
+        def __init__(self, coords: _Coords) -> None:
+            self.DesktopCoordinates = coords
+
+    class _Out:
+        def __init__(self, left: int, top: int, right: int, bottom: int) -> None:
+            self.desc = _Desc(_Coords(left, top, right, bottom))
+
+    class _Factory:
+        outputs = [
+            [_Out(-1920, 0, 0, 1080), _Out(0, 0, 3840, 2160)],
+        ]
+
+    from types import SimpleNamespace
+
+    fake_dxcam = SimpleNamespace(__factory=_Factory())
+
+    assert _DXCamGrabber._match_dxcam_output(
+        fake_dxcam, monitor_index=2, target_rect=(-1920, 0, 1920, 1080)
+    ) == (0, 0)
+    assert _DXCamGrabber._match_dxcam_output(
+        fake_dxcam, monitor_index=1, target_rect=(0, 0, 3840, 2160)
+    ) == (0, 1)
+
+
+def test_capture_engine_set_monitor_rewarms_and_records_new_dimensions(tmp_path: Path) -> None:
+    clear_encoder_cache()
+    created: list[int] = []
+
+    def _grabber_for_monitor(cfg: CaptureConfig) -> _SyntheticGrabber:
+        created.append(cfg.monitor_index)
+        if cfg.monitor_index == 2:
+            return _SyntheticGrabber(width=320, height=240)
+        return _SyntheticGrabber(width=640, height=360)
+
+    cfg = CaptureConfig(
+        temp_dir=tmp_path,
+        temp_filename="temp_raw_mon.mkv",
+        fps=30,
+        monitor_index=1,
+        prefer_hardware_encoder=False,
+    )
+    engine = CaptureEngine(cfg, grabber_factory=_grabber_for_monitor)
+
+    try:
+        engine.warm_up()
+        assert engine.state == CaptureState.STANDBY
+        assert engine.capture_size == (640, 360)
+        assert created == [1]
+
+        engine.set_monitor(2, rewarm=True)
+        assert engine.state == CaptureState.STANDBY
+        assert cfg.monitor_index == 2
+        assert engine.capture_size == (320, 240)
+        assert created == [1, 2]
+
+        engine.start_recording()
+        with pytest.raises(RuntimeError, match="Cannot change monitor"):
+            engine.set_monitor(1)
+        time.sleep(0.8)
+        result = engine.stop_recording()
+        assert result.is_valid
+        assert result.width == 320
+        assert result.height == 240
+    finally:
+        engine.shutdown()
+        clear_encoder_cache()
 
 
 

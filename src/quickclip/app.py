@@ -10,16 +10,17 @@ import sys
 from typing import Any
 
 from PySide6.QtCore import QCoreApplication, QObject, Qt, Signal, Slot
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
-from quickclip.capture import CaptureEngine, HotkeyListener
+from quickclip.capture import CaptureEngine, HotkeyListener, list_monitors
 from quickclip.contracts import (
     AppConfig,
     CaptureConfig,
     CaptureResult,
     CaptureState,
+    MonitorInfo,
     TrimRequest,
     TrimResult,
 )
@@ -57,6 +58,43 @@ def try_activate_existing_instance(
     return True
 
 
+def _discover_monitors_with_qt_names() -> list[MonitorInfo]:
+    """Enumerate monitors via capture backend and enrich names from Qt screens."""
+    monitors = list_monitors()
+    if not monitors:
+        return []
+
+    screens = QGuiApplication.screens()
+    if not screens:
+        return monitors
+
+    by_origin: dict[tuple[int, int], str] = {}
+    for screen in screens:
+        geom = screen.geometry()
+        raw_name = (screen.name() or screen.model() or "").strip()
+        if raw_name.startswith("\\\\.\\"):
+            raw_name = raw_name[4:]
+        if raw_name:
+            by_origin[(int(geom.x()), int(geom.y()))] = raw_name
+
+    enriched: list[MonitorInfo] = []
+    for mon in monitors:
+        friendly = by_origin.get((mon.left, mon.top), "")
+        name = mon.name or friendly
+        enriched.append(
+            MonitorInfo(
+                index=mon.index,
+                name=name,
+                width=mon.width,
+                height=mon.height,
+                left=mon.left,
+                top=mon.top,
+                is_primary=mon.is_primary,
+            )
+        )
+    return enriched
+
+
 class QuickClipController(QObject):
     """Thread-safe orchestrator connecting hotkeys, capture engine, trimmer UI, and exporter."""
 
@@ -91,6 +129,7 @@ class QuickClipController(QObject):
         single_instance_name: str | None = None,
         startup_enabled_fn: Callable[[], bool] | None = None,
         set_startup_fn: Callable[[bool], bool] | None = None,
+        monitors_fn: Callable[[], list[MonitorInfo]] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -151,8 +190,14 @@ class QuickClipController(QObject):
             if set_startup_fn is not None
             else lambda enabled: startup_mod.set_run_at_startup(enabled)
         )
+        self._monitors_fn = (
+            monitors_fn
+            if monitors_fn is not None
+            else _discover_monitors_with_qt_names
+        )
 
         self._sync_startup_checkbox()
+        self.refresh_monitors()
         self._connect_signals()
         self._start_single_instance_server()
 
@@ -189,6 +234,10 @@ class QuickClipController(QObject):
     def _connect_signals(self) -> None:
         self._standby.recordToggleRequested.connect(self.toggle_recording)
         self._standby.quickClipRequested.connect(self.start_quick_clip)
+        if hasattr(self._standby, "monitorChanged"):
+            self._standby.monitorChanged.connect(self.select_monitor)
+        if hasattr(self._standby, "monitorRefreshRequested"):
+            self._standby.monitorRefreshRequested.connect(self._on_monitor_refresh_requested)
         self._standby.startupToggled.connect(self._on_startup_toggled)
         self._standby.quitRequested.connect(self.shutdown)
 
@@ -210,6 +259,92 @@ class QuickClipController(QObject):
             enabled = False
         if hasattr(self._standby, "set_run_at_startup_checked"):
             self._standby.set_run_at_startup_checked(enabled)
+
+    def refresh_monitors(self, *, notify: bool = False) -> list[MonitorInfo]:
+        """Re-enumerate connected monitors and sync the standby display selector."""
+        try:
+            monitors = list(self._monitors_fn())
+        except Exception:
+            logger.debug("Failed enumerating display monitors.", exc_info=True)
+            monitors = []
+
+        if monitors:
+            available_indices = {m.index for m in monitors}
+            if self._config.capture.monitor_index not in available_indices:
+                fallback = next(
+                    (m.index for m in monitors if m.is_primary),
+                    monitors[0].index,
+                )
+                self._config.capture.monitor_index = fallback
+
+        if hasattr(self._standby, "set_monitors"):
+            self._standby.set_monitors(
+                monitors,
+                selected_index=self._config.capture.monitor_index,
+            )
+
+        if notify:
+            count = len(monitors)
+            self._set_status(
+                f"{count} ekran algılandı."
+                if count > 0
+                else "Ekran listesi güncellendi (varsayılan ekran kullanılıyor)."
+            )
+        return monitors
+
+    @Slot()
+    def _on_monitor_refresh_requested(self) -> None:
+        self.refresh_monitors(notify=True)
+
+    @Slot(int)
+    def select_monitor(self, monitor_index: int) -> None:
+        """Switch the capture target monitor and re-arm Warm Standby off the UI thread."""
+        target = int(monitor_index)
+        if target < 0 or self._shutting_down:
+            return
+        if (
+            self._warm_in_flight
+            or self._start_in_flight
+            or self._stop_in_flight
+            or self._capture_pending
+            or self._export_in_flight
+            or self._unhandled_capture_path is not None
+            or self._capture_engine.state
+            in (CaptureState.WARMING, CaptureState.RECORDING, CaptureState.STOPPING)
+        ):
+            if hasattr(self._standby, "set_selected_monitor"):
+                self._standby.set_selected_monitor(self._config.capture.monitor_index)
+            self._set_status("Kayıt veya işlem sürerken ekran değiştirilemez.")
+            return
+
+        if (
+            target == self._config.capture.monitor_index
+            and self._capture_engine.state == CaptureState.STANDBY
+        ):
+            return
+
+        self._config.capture.monitor_index = target
+        self._warm_in_flight = True
+        self._set_ui_state(CaptureState.WARMING, "Kodlayıcı: Hazırlanıyor...")
+        self._set_status(f"Ekran {target} için kayıt motoru hazırlanıyor...")
+        self._executor.submit(self._worker_switch_monitor, target)
+
+    def _worker_switch_monitor(self, monitor_index: int) -> None:
+        if self._shutting_down:
+            self._warmUpFailed.emit("Uygulama kapatılıyor.")
+            return
+        try:
+            if hasattr(self._capture_engine, "set_monitor"):
+                self._capture_engine.set_monitor(monitor_index, rewarm=True)
+            else:
+                self._config.capture.monitor_index = monitor_index
+                self._capture_engine.warm_up()
+        except Exception as exc:
+            self._warmUpFailed.emit(str(exc))
+            return
+        encoder = getattr(self._capture_engine, "encoder_used", None) or "h264"
+        backend = getattr(self._capture_engine, "grabber_backend", None) or ""
+        self._warmUpSucceeded.emit(encoder, backend)
 
     @Slot(bool)
     def _on_startup_toggled(self, enabled: bool) -> None:
@@ -371,6 +506,9 @@ class QuickClipController(QObject):
         if self._shutting_down:
             return
         detail = f"Kodlayıcı: {encoder} ({backend})" if backend else f"Kodlayıcı: {encoder}"
+        size = getattr(self._capture_engine, "capture_size", None)
+        if isinstance(size, tuple) and len(size) == 2 and size[0] > 0 and size[1] > 0:
+            detail = f"{detail} • {size[0]}x{size[1]}"
         self._set_ui_state(CaptureState.STANDBY, detail)
         self._set_status(f"Hazır — {self._config.capture.hotkey} ile kayda başla")
 

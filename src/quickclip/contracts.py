@@ -36,6 +36,28 @@ class CaptureState(str, Enum):
         return self.value
 
 
+@dataclass(frozen=True)
+class MonitorInfo:
+    """Metadata describing a captureable display monitor."""
+
+    index: int
+    name: str
+    width: int
+    height: int
+    left: int = 0
+    top: int = 0
+    is_primary: bool = False
+
+    @property
+    def label(self) -> str:
+        """Return a concise UI-friendly label describing this monitor."""
+        clean_name = self.name.strip()
+        prefix = f"Ekran {self.index} • {clean_name}" if clean_name else f"Ekran {self.index}"
+        dims = f"{self.width}x{self.height}"
+        suffix = f"{dims} • Birincil" if self.is_primary else dims
+        return f"{prefix} ({suffix})"
+
+
 @dataclass
 class CaptureConfig:
     """Configuration options controlling capture and pre-warming behavior."""
@@ -226,6 +248,7 @@ __all__ = [
     "ICaptureEngine",
     "IExporterService",
     "IHotkeyListener",
+    "MonitorInfo",
     "TrimRequest",
     "TrimResult",
 ]

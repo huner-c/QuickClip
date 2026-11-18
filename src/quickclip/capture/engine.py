@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from quickclip.capture.audio import resolve_audio_input
+from quickclip.capture.monitors import resolve_monitor_rect
 from quickclip.contracts import CaptureConfig, CaptureResult, CaptureState
 from quickclip.paths import resolve_ffmpeg_path, resolve_ffprobe_path
 
@@ -150,7 +151,11 @@ class ScreenGrabber(Protocol):
 class _DXCamGrabber:
     """DXGI Desktop Duplication grabber backed by ``dxcam`` (numpy BGRA mode)."""
 
-    def __init__(self, monitor_index: int) -> None:
+    def __init__(
+        self,
+        monitor_index: int,
+        target_rect: tuple[int, int, int, int] | None = None,
+    ) -> None:
         if monitor_index < 1:
             raise ValueError("DXCam requires monitor_index >= 1.")
 
@@ -162,8 +167,13 @@ class _DXCamGrabber:
         self._error_logged = False
         self._closed = False
 
-        output_idx = None if monitor_index == 1 else monitor_index - 1
+        device_idx, output_idx = self._match_dxcam_output(
+            dxcam,
+            monitor_index=monitor_index,
+            target_rect=target_rect,
+        )
         cam = dxcam.create(
+            device_idx=device_idx,
             output_idx=output_idx,
             output_color="BGRA",
             processor_backend="numpy",
@@ -178,6 +188,34 @@ class _DXCamGrabber:
         except Exception:
             self.close()
             raise
+
+    @staticmethod
+    def _match_dxcam_output(
+        dxcam_mod: Any,
+        *,
+        monitor_index: int,
+        target_rect: tuple[int, int, int, int] | None,
+    ) -> tuple[int, int | None]:
+        """Match MSS monitor geometry against DXCam outputs when available."""
+        if target_rect is not None:
+            factory = getattr(dxcam_mod, "__factory", None)
+            outputs_by_dev = getattr(factory, "outputs", None)
+            if isinstance(outputs_by_dev, list):
+                for d_idx, dev_outputs in enumerate(outputs_by_dev):
+                    for o_idx, out in enumerate(dev_outputs):
+                        desc = getattr(out, "desc", None)
+                        coords = getattr(desc, "DesktopCoordinates", None)
+                        if coords is None:
+                            continue
+                        rect = (
+                            int(coords.left),
+                            int(coords.top),
+                            int(coords.right - coords.left),
+                            int(coords.bottom - coords.top),
+                        )
+                        if rect == target_rect:
+                            return d_idx, o_idx
+        return 0, (None if monitor_index == 1 else monitor_index - 1)
 
     @property
     def backend_name(self) -> str:
@@ -377,8 +415,9 @@ def _create_default_grabber(config: CaptureConfig) -> tuple[ScreenGrabber, bytes
         raise ValueError(f"monitor_index must be >= 0, got {config.monitor_index}")
 
     if config.monitor_index >= 1:
+        target_rect = resolve_monitor_rect(config.monitor_index)
         try:
-            dxcam_grabber = _DXCamGrabber(config.monitor_index)
+            dxcam_grabber = _DXCamGrabber(config.monitor_index, target_rect=target_rect)
             seed: bytes | None = None
             first = dxcam_grabber.grab()
             if first is not None:
@@ -440,6 +479,8 @@ class CaptureEngine:
 
         self._encoder_used: str | None = None
         self._grabber: ScreenGrabber | None = None
+        self._grabber_monitor_index: int | None = None
+        self._warmed_monitor_index: int | None = None
         self._seed_frame: bytes | None = None
         self._capture_size: tuple[int, int] | None = None
         self._has_audio: bool = False
@@ -528,6 +569,7 @@ class CaptureEngine:
                 if (
                     self._proc is not None
                     and self._proc.poll() is None
+                    and self._warmed_monitor_index == self._config.monitor_index
                     and not self._shutdown_requested.is_set()
                 ):
                     return
@@ -536,6 +578,7 @@ class CaptureEngine:
                     f"Cannot call warm_up() while engine is in state {self._state.value}."
                 )
             self._state = CaptureState.WARMING
+            self._warmed_monitor_index = None
             self._shutdown_requested.clear()
             self._warm_done_event.clear()
             self._last_result = None
@@ -548,6 +591,9 @@ class CaptureEngine:
             self._encoder_used = encoder
             self._check_not_shutting_down()
 
+            if self._grabber is not None and self._grabber_monitor_index != self._config.monitor_index:
+                self._release_grabber()
+
             if self._grabber is None:
                 if self._grabber_factory is not None:
                     grabber = self._grabber_factory(self._config)
@@ -556,6 +602,7 @@ class CaptureEngine:
                 else:
                     grabber, seed = _create_default_grabber(self._config)
                 self._grabber = grabber
+                self._grabber_monitor_index = self._config.monitor_index
             else:
                 grabber = self._grabber
                 try:
@@ -628,6 +675,7 @@ class CaptureEngine:
 
             with self._state_lock:
                 self._check_not_shutting_down()
+                self._warmed_monitor_index = self._config.monitor_index
                 self._state = CaptureState.STANDBY
         except _WarmupAbortedError:
             self._terminate_standby_process(remove_incomplete=True)
@@ -696,6 +744,38 @@ class CaptureEngine:
             if timer is not None:
                 timer.start()
 
+    def set_monitor(self, monitor_index: int, *, rewarm: bool = False) -> None:
+        """Switch the target display ``monitor_index`` when not recording or warming."""
+        target_index = int(monitor_index)
+        if target_index < 0:
+            raise ValueError(f"monitor_index must be >= 0, got {monitor_index}")
+
+        needs_reset = False
+        with self._state_lock:
+            if self._state in (
+                CaptureState.WARMING,
+                CaptureState.RECORDING,
+                CaptureState.STOPPING,
+            ):
+                raise RuntimeError(
+                    f"Cannot change monitor while engine is in state {self._state.value}."
+                )
+            changed = self._config.monitor_index != target_index
+            self._config.monitor_index = target_index
+            if changed or self._grabber_monitor_index != target_index:
+                needs_reset = True
+                self._warmed_monitor_index = None
+                if self._state == CaptureState.STANDBY:
+                    self._state = CaptureState.COLD
+
+        if needs_reset:
+            self._terminate_standby_process(remove_incomplete=True)
+            self._release_grabber()
+            self._capture_size = None
+
+        if rewarm:
+            self.warm_up()
+
     def stop_recording(self) -> CaptureResult:
         """Stop the active recording cleanly and return capture metadata."""
         return self._stop_internal(from_auto_stop=False)
@@ -727,6 +807,7 @@ class CaptureEngine:
         self._release_grabber()
 
         with self._state_lock:
+            self._warmed_monitor_index = None
             self._state = CaptureState.COLD
 
     def _on_auto_stop_timer(self) -> None:
@@ -1068,6 +1149,7 @@ class CaptureEngine:
     def _release_grabber(self) -> None:
         grabber = self._grabber
         self._grabber = None
+        self._grabber_monitor_index = None
         self._seed_frame = None
         if grabber is not None:
             try:

@@ -40,8 +40,11 @@ QuickClip splits capture, UI preview/trimming, lossless export, and orchestratio
 
 4. **Inter-Module Contracts (`src/quickclip/contracts.py`):**
    - `CaptureState(str, Enum)`: `COLD`, `WARMING`, `STANDBY`, `RECORDING`, `STOPPING`, `ERROR`
-   - `CaptureConfig`, `CaptureResult` (with `.is_valid`), `TrimRequest` (with `.validate()`), `TrimResult`, `AppConfig`
+   - `MonitorInfo`, `CaptureConfig`, `CaptureResult` (with `.is_valid`), `TrimRequest` (with `.validate()`), `TrimResult`, `AppConfig`
    - Runtime-checkable protocols: `ICaptureEngine`, `IExporterService`, `IHotkeyListener`
+
+5. **Multi-Monitor Selection (`list_monitors` & `StandbyWindow`):**
+   - Enumerates connected displays (`Ekran 1`, `Ekran 2`, ...) and matches physical coordinates across `dxcam` and `mss`. Changing the selected screen on the Warm Standby bar cleanly re-arms the capture engine for that display's exact resolution.
 
 ## Requirements & Setup
 

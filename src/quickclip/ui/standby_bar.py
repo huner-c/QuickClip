@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 import time
 
@@ -9,6 +10,7 @@ from PySide6.QtCore import QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal, Sl
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -20,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from quickclip.contracts import AppConfig, CaptureState
+from quickclip.contracts import AppConfig, CaptureState, MonitorInfo
 from quickclip.ui._icons import load_app_icon
 
 _STATE_META: dict[CaptureState, tuple[str, str, str]] = {
@@ -122,6 +124,37 @@ QCheckBox#startupCheckbox::indicator:checked {
     background-color: #2563eb;
     border-color: #3b82f6;
 }
+QComboBox#monitorCombo {
+    background-color: #252b38;
+    border: 1px solid #3a4459;
+    border-radius: 5px;
+    color: #e2e8f0;
+    font-size: 12px;
+    padding: 4px 8px;
+}
+QComboBox#monitorCombo:disabled {
+    color: #64748b;
+    background-color: #171a22;
+    border-color: #232834;
+}
+QComboBox#monitorCombo::drop-down {
+    border: none;
+    width: 20px;
+}
+QComboBox#monitorCombo QAbstractItemView {
+    background-color: #191d26;
+    color: #e2e8f0;
+    border: 1px solid #3a4459;
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
+}
+QPushButton#refreshMonitorsButton {
+    padding: 4px 0px;
+    font-size: 13px;
+    font-weight: 700;
+    min-width: 28px;
+    max-width: 28px;
+}
 """
 
 
@@ -177,6 +210,8 @@ class StandbyWindow(QMainWindow):
 
     recordToggleRequested = Signal()
     quickClipRequested = Signal(float)
+    monitorChanged = Signal(int)
+    monitorRefreshRequested = Signal()
     startupToggled = Signal(bool)
     quitRequested = Signal()
 
@@ -198,7 +233,7 @@ class StandbyWindow(QMainWindow):
         app_icon = load_app_icon()
         if not app_icon.isNull():
             self.setWindowIcon(app_icon)
-        self.setFixedWidth(440)
+        self.setFixedWidth(460)
         self.setStyleSheet(_STANDBY_STYLESHEET)
 
         self._elapsed_timer = QTimer(self)
@@ -277,6 +312,28 @@ class StandbyWindow(QMainWindow):
         self.encoder_label.setProperty("class", "metaKey")
         meta_row.addWidget(self.encoder_label)
         card_layout.addLayout(meta_row)
+
+        # Target display selector row.
+        monitor_row = QHBoxLayout()
+        monitor_row.setSpacing(6)
+
+        monitor_caption = QLabel("Ekran:", root)
+        monitor_caption.setProperty("class", "metaKey")
+        monitor_row.addWidget(monitor_caption)
+
+        self.monitor_combo = QComboBox(root)
+        self.monitor_combo.setObjectName("monitorCombo")
+        self.monitor_combo.setToolTip("Kayıt alınacak ekranı seçin")
+        self.monitor_combo.addItem("Ekran 1 (Birincil)", 1)
+        self.monitor_combo.currentIndexChanged.connect(self._on_monitor_combo_changed)
+        monitor_row.addWidget(self.monitor_combo, 1)
+
+        self.refresh_monitors_button = QPushButton("↻", root)
+        self.refresh_monitors_button.setObjectName("refreshMonitorsButton")
+        self.refresh_monitors_button.setToolTip("Bağlı ekran listesini yenile")
+        self.refresh_monitors_button.clicked.connect(self.monitorRefreshRequested.emit)
+        monitor_row.addWidget(self.refresh_monitors_button, 0)
+        card_layout.addLayout(monitor_row)
 
         # Output directory label.
         self.output_dir_label = QLabel("", root)
@@ -408,6 +465,14 @@ class StandbyWindow(QMainWindow):
         self.record_button.style().unpolish(self.record_button)
         self.record_button.style().polish(self.record_button)
 
+        can_change_monitor = resolved not in (
+            CaptureState.WARMING,
+            CaptureState.RECORDING,
+            CaptureState.STOPPING,
+        )
+        self.monitor_combo.setEnabled(can_change_monitor)
+        self.refresh_monitors_button.setEnabled(can_change_monitor)
+
         # Tray visual feedback.
         if self._tray_icon is not None:
             dot_color = (
@@ -453,6 +518,50 @@ class StandbyWindow(QMainWindow):
     def is_run_at_startup_checked(self) -> bool:
         """Return whether the ``Windows ile Başlat`` checkbox is currently checked."""
         return self.startup_checkbox.isChecked()
+
+    def set_monitors(
+        self,
+        monitors: Sequence[MonitorInfo],
+        selected_index: int | None = None,
+    ) -> None:
+        """Populate available monitors without emitting ``monitorChanged``."""
+        target = selected_index if selected_index is not None else self.selected_monitor_index()
+        with QSignalBlocker(self.monitor_combo):
+            self.monitor_combo.clear()
+            if not monitors:
+                self.monitor_combo.addItem("Ekran 1 (Birincil)", 1)
+            else:
+                for mon in monitors:
+                    self.monitor_combo.addItem(mon.label, int(mon.index))
+                idx_pos = self.monitor_combo.findData(int(target))
+                if idx_pos >= 0:
+                    self.monitor_combo.setCurrentIndex(idx_pos)
+                else:
+                    primary_pos = next(
+                        (i for i, mon in enumerate(monitors) if mon.is_primary),
+                        0,
+                    )
+                    self.monitor_combo.setCurrentIndex(primary_pos)
+
+    def set_selected_monitor(self, monitor_index: int) -> None:
+        """Select ``monitor_index`` in the dropdown without emitting ``monitorChanged``."""
+        with QSignalBlocker(self.monitor_combo):
+            pos = self.monitor_combo.findData(int(monitor_index))
+            if pos >= 0:
+                self.monitor_combo.setCurrentIndex(pos)
+
+    def selected_monitor_index(self) -> int:
+        """Return the currently selected 1-based monitor index."""
+        data = self.monitor_combo.currentData()
+        return int(data) if data is not None else 1
+
+    @Slot(int)
+    def _on_monitor_combo_changed(self, combo_index: int) -> None:
+        if combo_index < 0:
+            return
+        data = self.monitor_combo.itemData(combo_index)
+        if data is not None:
+            self.monitorChanged.emit(int(data))
 
     @Slot()
     def _on_quick_clip_clicked(self) -> None:

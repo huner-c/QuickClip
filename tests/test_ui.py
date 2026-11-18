@@ -12,7 +12,7 @@ from PySide6.QtGui import QIcon, QMouseEvent
 from PySide6.QtWidgets import QSystemTrayIcon
 import pytest
 
-from quickclip.contracts import CaptureResult, CaptureState, TrimRequest, TrimResult
+from quickclip.contracts import CaptureResult, CaptureState, MonitorInfo, TrimRequest, TrimResult
 from quickclip.ui import RangeSlider, StandbyWindow, TrimmerWindow
 from quickclip.ui.standby_bar import _build_tray_icon
 
@@ -593,3 +593,47 @@ def test_standby_startup_checkbox_sync_vs_user_toggle(qtbot, monkeypatch, tmp_pa
     qtbot.mouseClick(window.startup_checkbox, Qt.MouseButton.LeftButton)
     assert window.is_run_at_startup_checked() is False
     assert emitted == [True, False]
+
+
+def test_standby_monitor_selector_signals_and_state_gating(qtbot, monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: False))
+
+    window = StandbyWindow(hotkey="F9", output_dir=tmp_path)
+    qtbot.addWidget(window)
+
+    monitors = [
+        MonitorInfo(index=1, name="PrimaryDisp", width=3840, height=2160, left=0, top=0, is_primary=True),
+        MonitorInfo(index=2, name="SideDisp", width=1920, height=1080, left=-1920, top=0, is_primary=False),
+    ]
+    changed: list[int] = []
+    refreshed: list[bool] = []
+    window.monitorChanged.connect(changed.append)
+    window.monitorRefreshRequested.connect(lambda: refreshed.append(True))
+
+    # Programmatic population/selection must NOT emit monitorChanged.
+    window.set_monitors(monitors, selected_index=1)
+    assert window.monitor_combo.count() == 2
+    assert window.selected_monitor_index() == 1
+    window.set_selected_monitor(2)
+    assert window.selected_monitor_index() == 2
+    window.set_selected_monitor(1)
+    assert changed == []
+
+    # Interactive selection emits monitorChanged(2).
+    window.monitor_combo.setCurrentIndex(1)
+    assert window.selected_monitor_index() == 2
+    assert changed == [2]
+
+    # Refresh button emits monitorRefreshRequested.
+    qtbot.mouseClick(window.refresh_monitors_button, Qt.MouseButton.LeftButton)
+    assert refreshed == [True]
+
+    # Switching monitor is disabled while warming, recording, or stopping.
+    for blocked_state in (CaptureState.WARMING, CaptureState.RECORDING, CaptureState.STOPPING):
+        window.set_state(blocked_state)
+        assert window.monitor_combo.isEnabled() is False
+        assert window.refresh_monitors_button.isEnabled() is False
+
+    window.set_state(CaptureState.STANDBY)
+    assert window.monitor_combo.isEnabled() is True
+    assert window.refresh_monitors_button.isEnabled() is True

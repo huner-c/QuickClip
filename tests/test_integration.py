@@ -21,6 +21,7 @@ from quickclip.contracts import (
     CaptureResult,
     CaptureState,
     IHotkeyListener,
+    MonitorInfo,
     TrimResult,
 )
 
@@ -627,3 +628,82 @@ def test_windowed_logging_when_stderr_is_none(
             root_logger.removeHandler(h)
         monkeypatch.undo()
         configure_logging(verbose=False)
+
+
+def test_monitor_selection_rewarms_and_records_selected_screen(qtbot, tmp_path: Path) -> None:
+    fake_monitors = [
+        MonitorInfo(index=1, name="MainDisp", width=640, height=360, left=0, top=0, is_primary=True),
+        MonitorInfo(index=2, name="SecondDisp", width=320, height=240, left=640, top=0, is_primary=False),
+    ]
+
+    def _grabber_for_monitor(cfg: CaptureConfig) -> _SyntheticGrabber:
+        if cfg.monitor_index == 2:
+            return _SyntheticGrabber(width=320, height=240)
+        return _SyntheticGrabber(width=640, height=360)
+
+    config = AppConfig(
+        capture=CaptureConfig(
+            temp_dir=tmp_path / "temp",
+            fps=30,
+            keyframe_interval_sec=0.5,
+            monitor_index=1,
+            prefer_hardware_encoder=False,
+        ),
+        output_dir=tmp_path / "exports",
+    )
+    controller = QuickClipController(
+        config=config,
+        hotkey_listener=_StubHotkeyListener(),
+        grabber_factory=_grabber_for_monitor,
+        monitors_fn=lambda: fake_monitors,
+        enable_tray=False,
+        auto_close_ms=0,
+        quit_on_exit=False,
+    )
+    captures: list[CaptureResult] = []
+    exports: list[TrimResult] = []
+    controller.captureFinished.connect(captures.append)
+    controller.exportFinished.connect(exports.append)
+
+    try:
+        controller.start(show_standby=True)
+        qtbot.waitUntil(
+            lambda: controller.capture_engine.state == CaptureState.STANDBY
+            and controller.standby_window.state == CaptureState.STANDBY,
+            timeout=15000,
+        )
+        assert controller.standby_window.monitor_combo.count() == 2
+        assert controller.capture_engine.capture_size == (640, 360)
+
+        # User selects Ekran 2 in the StandbyWindow dropdown.
+        controller.standby_window.monitor_combo.setCurrentIndex(1)
+        qtbot.waitUntil(
+            lambda: controller.capture_engine.state == CaptureState.STANDBY
+            and controller.capture_engine.capture_size == (320, 240),
+            timeout=15000,
+        )
+        assert config.capture.monitor_index == 2
+        assert "320x240" in controller.standby_window.encoder_label.text()
+
+        # Record 1.0s on the newly selected monitor and direct-save.
+        controller.start_quick_clip(1.0)
+        qtbot.waitUntil(lambda: len(captures) == 1, timeout=15000)
+
+        cap_res = captures[0]
+        assert cap_res.is_valid is True
+        assert cap_res.width == 320
+        assert cap_res.height == 240
+
+        trimmer = controller.trimmer_window
+        assert trimmer is not None
+        trimmer.direct_save_button.click()
+        qtbot.waitUntil(lambda: len(exports) == 1, timeout=15000)
+
+        trim_res = exports[0]
+        assert trim_res.success is True and trim_res.output_path is not None
+        probed = _probe_mp4(trim_res.output_path)
+        v_stream = next(s for s in probed["streams"] if s["codec_type"] == "video")
+        assert v_stream["width"] == 320
+        assert v_stream["height"] == 240
+    finally:
+        controller.shutdown()

@@ -8,6 +8,7 @@ from quickclip.contracts import (
     ICaptureEngine,
     IExporterService,
     IHotkeyListener,
+    MonitorInfo,
     TrimRequest,
     TrimResult,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "ICaptureEngine",
     "IExporterService",
     "IHotkeyListener",
+    "MonitorInfo",
     "RUN_KEY_PATH",
     "TrimRequest",
     "TrimResult",

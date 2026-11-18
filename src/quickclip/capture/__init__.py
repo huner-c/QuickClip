@@ -18,6 +18,10 @@ from quickclip.capture.hotkey import (
     HotkeyListener,
     parse_hotkey,
 )
+from quickclip.capture.monitors import (
+    list_monitors,
+    resolve_monitor_rect,
+)
 
 __all__ = [
     "AudioDevice",
@@ -28,8 +32,10 @@ __all__ = [
     "build_encoder_args",
     "clear_encoder_cache",
     "list_audio_devices",
+    "list_monitors",
     "parse_dshow_audio_devices",
     "parse_hotkey",
     "probe_audio_device",
     "resolve_audio_input",
+    "resolve_monitor_rect",
 ]
