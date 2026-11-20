@@ -17,6 +17,7 @@ import quickclip.ui
 from quickclip.contracts import (
     AppConfig,
     CaptureConfig,
+    CaptureRegion,
     CaptureResult,
     CaptureState,
     ICaptureEngine,
@@ -26,6 +27,7 @@ from quickclip.contracts import (
     TrimRequest,
     TrimResult,
 )
+from quickclip.settings import UserSettings, load_user_settings, save_user_settings
 
 
 def test_package_exports_and_subpackages() -> None:
@@ -346,3 +348,41 @@ def test_monitor_info_contract_and_label() -> None:
     assert quickclip.MonitorInfo is MonitorInfo
     assert primary.label == "Ekran 1 • DisplayA (3840x2160 • Birincil)"
     assert secondary.label == "Ekran 2 (1920x1080)"
+
+
+def test_capture_region_validation_and_normalization() -> None:
+    region = CaptureRegion(left=100, top=50, width=641, height=361, monitor_index=2)
+    assert region.right == 741
+    assert region.bottom == 411
+
+    norm = region.normalized(1920, 1080)
+    assert norm == CaptureRegion(left=100, top=50, width=640, height=360, monitor_index=2)
+
+    clamped = CaptureRegion(left=1900, top=1070, width=200, height=200, monitor_index=1).normalized(
+        1920, 1080
+    )
+    assert clamped == CaptureRegion(left=1900, top=1070, width=20, height=10, monitor_index=1)
+
+    with pytest.raises(ValueError):
+        CaptureRegion(left=-1, top=0, width=100, height=100)
+    with pytest.raises(ValueError):
+        CaptureRegion(left=0, top=0, width=0, height=100)
+    with pytest.raises(ValueError):
+        CaptureRegion(left=0, top=0, width=100, height=-5)
+
+
+def test_user_settings_save_load_and_corrupt_fallback(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "settings.json"
+    assert load_user_settings(cfg_path) == UserSettings()
+
+    saved = UserSettings(
+        hotkey="Ctrl+Shift+R",
+        output_dir=str(tmp_path / "clips"),
+        monitor_index=2,
+        region_mode=True,
+    )
+    assert save_user_settings(saved, cfg_path) is True
+    assert load_user_settings(cfg_path) == saved
+
+    cfg_path.write_text("{not-valid-json", encoding="utf-8")
+    assert load_user_settings(cfg_path) == UserSettings()

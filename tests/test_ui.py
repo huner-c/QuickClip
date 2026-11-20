@@ -7,13 +7,20 @@ from pathlib import Path
 import shutil
 import subprocess
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt
 from PySide6.QtGui import QIcon, QMouseEvent
-from PySide6.QtWidgets import QSystemTrayIcon
+from PySide6.QtWidgets import QFileDialog, QSystemTrayIcon
 import pytest
 
-from quickclip.contracts import CaptureResult, CaptureState, MonitorInfo, TrimRequest, TrimResult
-from quickclip.ui import RangeSlider, StandbyWindow, TrimmerWindow
+from quickclip.contracts import CaptureRegion, CaptureResult, CaptureState, MonitorInfo, TrimRequest, TrimResult
+from quickclip.ui import (
+    RangeSlider,
+    RegionSelectorOverlay,
+    StandbyWindow,
+    TrimmerWindow,
+    logical_rect_to_capture_region,
+    qt_key_event_to_hotkey,
+)
 from quickclip.ui.standby_bar import _build_tray_icon
 
 
@@ -637,3 +644,122 @@ def test_standby_monitor_selector_signals_and_state_gating(qtbot, monkeypatch, t
     window.set_state(CaptureState.STANDBY)
     assert window.monitor_combo.isEnabled() is True
     assert window.refresh_monitors_button.isEnabled() is True
+
+
+def test_hotkey_conversion_and_standby_settings_controls(qtbot, monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: False))
+
+    assert qt_key_event_to_hotkey(Qt.Key.Key_F8, Qt.KeyboardModifier.NoModifier) == "F8"
+    assert (
+        qt_key_event_to_hotkey(
+            Qt.Key.Key_R,
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+        )
+        == "Ctrl+Shift+R"
+    )
+    assert qt_key_event_to_hotkey(Qt.Key.Key_A, Qt.KeyboardModifier.NoModifier) is None
+    assert qt_key_event_to_hotkey(Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier) is None
+    assert qt_key_event_to_hotkey(Qt.Key.Key_Control, Qt.KeyboardModifier.ControlModifier) is None
+
+    window = StandbyWindow(hotkey="F9", output_dir=tmp_path)
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+
+    hotkeys: list[str] = []
+    out_dirs: list[Path] = []
+    modes: list[bool] = []
+    window.hotkeyChanged.connect(hotkeys.append)
+    window.outputDirChanged.connect(out_dirs.append)
+    window.captureModeChanged.connect(modes.append)
+
+    # Hotkey capture: Escape cancels without emitting.
+    qtbot.mouseClick(window.change_hotkey_button, Qt.MouseButton.LeftButton)
+    assert window.is_capturing_hotkey() is True
+    qtbot.keyClick(window, Qt.Key.Key_Escape)
+    assert window.is_capturing_hotkey() is False
+    assert hotkeys == []
+
+    # Hotkey capture: pressing F8 emits hotkeyChanged("F8").
+    qtbot.mouseClick(window.change_hotkey_button, Qt.MouseButton.LeftButton)
+    assert window.is_capturing_hotkey() is True
+    qtbot.keyClick(window, Qt.Key.Key_F8)
+    assert window.is_capturing_hotkey() is False
+    assert hotkeys == ["F8"]
+
+    # Output directory picker emits outputDirChanged(Path).
+    chosen_dir = tmp_path / "custom_clips"
+    monkeypatch.setattr(
+        QFileDialog,
+        "getExistingDirectory",
+        staticmethod(lambda *_args, **_kwargs: str(chosen_dir)),
+    )
+    qtbot.mouseClick(window.change_output_dir_button, Qt.MouseButton.LeftButton)
+    assert out_dirs == [chosen_dir]
+    assert str(chosen_dir) in window.output_dir_label.text()
+
+    # Mode toggle switches between Full Screen and Region Selection.
+    assert window.is_region_mode() is False
+    assert window.record_button.text() == "Kaydı Başlat"
+    qtbot.mouseClick(window.region_mode_button, Qt.MouseButton.LeftButton)
+    assert window.is_region_mode() is True
+    assert window.record_button.text() == "Alan Seç & Kaydet"
+    assert modes == [True]
+
+    # Controls are locked during active recording.
+    window.set_state(CaptureState.RECORDING)
+    assert window.change_hotkey_button.isEnabled() is False
+    assert window.change_output_dir_button.isEnabled() is False
+    assert window.region_mode_button.isEnabled() is False
+    assert window.fullscreen_mode_button.isEnabled() is False
+
+
+def test_region_selector_overlay_dpi_conversion_drag_and_cancel(qtbot) -> None:
+    monitor = MonitorInfo(
+        index=1,
+        name="4KDisp",
+        width=3840,
+        height=2160,
+        left=0,
+        top=0,
+        is_primary=True,
+    )
+    # 200% DPI scaling: logical 1920x1080 overlay -> physical 3840x2160 monitor.
+    mapped = logical_rect_to_capture_region(
+        QRect(100, 50, 300, 200),
+        QSize(1920, 1080),
+        monitor,
+    )
+    assert mapped == CaptureRegion(left=200, top=100, width=600, height=400, monitor_index=1)
+
+    overlay = RegionSelectorOverlay(monitor=monitor, screen_geometry=QRect(0, 0, 640, 360))
+    qtbot.addWidget(overlay)
+    overlay.resize(640, 360)
+
+    selected: list[CaptureRegion] = []
+    cancelled: list[bool] = []
+    overlay.regionSelected.connect(selected.append)
+    overlay.selectionCancelled.connect(lambda: cancelled.append(True))
+
+    # Tiny click is ignored without emitting.
+    overlay.start_selection()
+    _send_mouse(overlay, QEvent.Type.MouseButtonPress, 40, 40)
+    _send_mouse(overlay, QEvent.Type.MouseButtonRelease, 45, 45)
+    assert selected == []
+    assert cancelled == []
+
+    # Valid drag emits scaled physical CaptureRegion and hides overlay.
+    _send_mouse(overlay, QEvent.Type.MouseButtonPress, 100, 60)
+    _send_mouse(overlay, QEvent.Type.MouseMove, 260, 150)
+    _send_mouse(overlay, QEvent.Type.MouseButtonRelease, 260, 150)
+    assert len(selected) == 1
+    assert selected[0].monitor_index == 1
+    assert selected[0].width == 960
+    assert selected[0].height == 540
+    assert overlay.isVisible() is False
+
+    # Escape cancels cleanly.
+    overlay.start_selection()
+    qtbot.keyClick(overlay, Qt.Key.Key_Escape)
+    assert cancelled == [True]
+    assert overlay.isVisible() is False

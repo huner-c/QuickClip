@@ -10,6 +10,7 @@ import tempfile
 
 from quickclip.app import QuickClipController, run_app
 from quickclip.contracts import AppConfig, CaptureConfig
+from quickclip.settings import UserSettings, load_user_settings
 
 
 def configure_logging(*, verbose: bool = False, temp_dir: Path | None = None) -> None:
@@ -40,8 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hotkey",
-        default="F9",
-        help="Global hotkey to start/stop recording (default: F9).",
+        default=None,
+        help="Global hotkey to start/stop recording (default: F9 or saved setting).",
     )
     parser.add_argument(
         "--fps",
@@ -85,8 +86,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--monitor",
         type=int,
-        default=1,
-        help="1-based display index to capture (default: 1).",
+        default=None,
+        help="1-based display index to capture (default: 1 or saved setting).",
+    )
+    parser.add_argument(
+        "--region",
+        action="store_true",
+        help="Start in Region Selection mode so starting capture lets you drag-select an area.",
     )
     parser.add_argument(
         "--no-tray",
@@ -106,23 +112,52 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_app_config(args: argparse.Namespace) -> AppConfig:
-    """Construct an :class:`AppConfig` from parsed CLI arguments."""
+def build_app_config(
+    args: argparse.Namespace,
+    *,
+    saved_settings: UserSettings | None = None,
+) -> AppConfig:
+    """Construct an :class:`AppConfig` from parsed CLI arguments and optional saved settings."""
     defaults = AppConfig()
     capture_defaults = CaptureConfig()
+
+    hotkey = (
+        args.hotkey
+        if args.hotkey is not None
+        else (saved_settings.hotkey if saved_settings and saved_settings.hotkey else capture_defaults.hotkey)
+    )
+    monitor_index = (
+        args.monitor
+        if args.monitor is not None
+        else (
+            saved_settings.monitor_index
+            if saved_settings and saved_settings.monitor_index is not None
+            else capture_defaults.monitor_index
+        )
+    )
+    output_dir = (
+        args.output_dir
+        if args.output_dir is not None
+        else (
+            Path(saved_settings.output_dir)
+            if saved_settings and saved_settings.output_dir
+            else defaults.output_dir
+        )
+    )
+
     capture_cfg = CaptureConfig(
         temp_dir=args.temp_dir if args.temp_dir is not None else capture_defaults.temp_dir,
-        hotkey=args.hotkey,
+        hotkey=hotkey,
         fps=args.fps,
         capture_audio=bool(args.audio),
         audio_device=args.audio_device,
         prefer_hardware_encoder=not bool(args.cpu_only),
-        monitor_index=args.monitor,
+        monitor_index=monitor_index,
         auto_stop_seconds=args.auto_stop,
     )
     return AppConfig(
         capture=capture_cfg,
-        output_dir=args.output_dir if args.output_dir is not None else defaults.output_dir,
+        output_dir=output_dir,
     )
 
 
@@ -156,13 +191,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    config = build_app_config(args)
+    saved_settings = None if args.headless_check else load_user_settings()
+    config = build_app_config(args, saved_settings=saved_settings)
     configure_logging(verbose=bool(args.verbose), temp_dir=config.capture.temp_dir)
 
     if args.headless_check:
         return run_headless_check(config)
 
-    return run_app(config=config, enable_tray=not bool(args.no_tray))
+    region_mode = bool(args.region) or bool(
+        saved_settings is not None and saved_settings.region_mode
+    )
+    return run_app(
+        config=config,
+        enable_tray=not bool(args.no_tray),
+        region_mode=region_mode,
+    )
 
 
 if __name__ == "__main__":

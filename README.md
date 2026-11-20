@@ -43,8 +43,10 @@ QuickClip splits capture, UI preview/trimming, lossless export, and orchestratio
    - `MonitorInfo`, `CaptureConfig`, `CaptureResult` (with `.is_valid`), `TrimRequest` (with `.validate()`), `TrimResult`, `AppConfig`
    - Runtime-checkable protocols: `ICaptureEngine`, `IExporterService`, `IHotkeyListener`
 
-5. **Multi-Monitor Selection (`list_monitors` & `StandbyWindow`):**
-   - Enumerates connected displays (`Ekran 1`, `Ekran 2`, ...) and matches physical coordinates across `dxcam` and `mss`. Changing the selected screen on the Warm Standby bar cleanly re-arms the capture engine for that display's exact resolution.
+5. **Multi-Monitor, Region Selection & Settings (`StandbyWindow`, `RegionSelectorOverlay`, `settings.py`):**
+   - Enumerates connected displays (`Ekran 1`, `Ekran 2`, ...) and matches physical coordinates across `dxcam` and `mss`.
+   - Switch between **Tam Ekran** (instant Warm Standby) and **Bölge Seç** (drag-select any area on screen after clicking Start Recording / hotkey, with DPI-aware coordinate scaling).
+   - Change the global hotkey (**Değiştir**) and export output folder (**Klasör Seç**) directly from the standby bar; preferences persist automatically in `%LOCALAPPDATA%\QuickClip\settings.json`.
 
 ## Requirements & Setup
 

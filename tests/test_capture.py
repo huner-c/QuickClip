@@ -30,7 +30,15 @@ from quickclip.capture import (
 )
 from quickclip.capture.engine import _DXCamGrabber
 from quickclip.capture.hotkey import MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, WM_HOTKEY, WM_QUIT
-from quickclip.contracts import CaptureConfig, CaptureResult, CaptureState, ICaptureEngine, IHotkeyListener, MonitorInfo
+from quickclip.contracts import (
+    CaptureConfig,
+    CaptureRegion,
+    CaptureResult,
+    CaptureState,
+    ICaptureEngine,
+    IHotkeyListener,
+    MonitorInfo,
+)
 
 
 class _SyntheticGrabber:
@@ -1014,6 +1022,61 @@ def test_capture_engine_set_monitor_rewarms_and_records_new_dimensions(tmp_path:
         assert result.is_valid
         assert result.width == 320
         assert result.height == 240
+    finally:
+        engine.shutdown()
+        clear_encoder_cache()
+
+
+def test_capture_engine_set_capture_region_and_small_region_fallback(tmp_path: Path) -> None:
+    clear_encoder_cache()
+
+    def _grabber_for_cfg(cfg: CaptureConfig) -> _SyntheticGrabber:
+        if cfg.capture_region is not None:
+            return _SyntheticGrabber(
+                width=cfg.capture_region.width,
+                height=cfg.capture_region.height,
+            )
+        return _SyntheticGrabber(width=640, height=360)
+
+    cfg = CaptureConfig(
+        temp_dir=tmp_path,
+        temp_filename="temp_raw_region.mkv",
+        fps=30,
+        monitor_index=1,
+        prefer_hardware_encoder=True,
+    )
+    engine = CaptureEngine(cfg, grabber_factory=_grabber_for_cfg)
+
+    try:
+        engine.warm_up()
+        assert engine.capture_size == (640, 360)
+
+        # Standard region size (>= 128x128) captures at exact region dimensions.
+        region = CaptureRegion(left=40, top=20, width=320, height=180, monitor_index=1)
+        engine.set_capture_region(region, rewarm=True)
+        assert engine.state == CaptureState.STANDBY
+        assert engine.capture_size == (320, 180)
+        engine.start_recording()
+        with pytest.raises(RuntimeError, match="Cannot change capture region"):
+            engine.set_capture_region(None)
+        time.sleep(0.7)
+        res = engine.stop_recording()
+        assert res.is_valid
+        assert res.width == 320
+        assert res.height == 180
+
+        # Tiny region (< 128x128) automatically falls back from hardware encoder to libx264.
+        tiny = CaptureRegion(left=10, top=10, width=64, height=64, monitor_index=1)
+        engine.set_capture_region(tiny, rewarm=True)
+        assert engine.state == CaptureState.STANDBY
+        assert engine.capture_size == (64, 64)
+        assert engine.encoder_used == "libx264"
+        engine.start_recording()
+        time.sleep(0.6)
+        tiny_res = engine.stop_recording()
+        assert tiny_res.is_valid
+        assert tiny_res.width == 64
+        assert tiny_res.height == 64
     finally:
         engine.shutdown()
         clear_encoder_cache()

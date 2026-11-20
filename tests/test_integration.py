@@ -18,12 +18,14 @@ from quickclip.app import QuickClipController, run_app, try_activate_existing_in
 from quickclip.contracts import (
     AppConfig,
     CaptureConfig,
+    CaptureRegion,
     CaptureResult,
     CaptureState,
     IHotkeyListener,
     MonitorInfo,
     TrimResult,
 )
+from quickclip.settings import UserSettings, load_user_settings
 
 
 class _SyntheticGrabber:
@@ -705,5 +707,204 @@ def test_monitor_selection_rewarms_and_records_selected_screen(qtbot, tmp_path: 
         v_stream = next(s for s in probed["streams"] if s["codec_type"] == "video")
         assert v_stream["width"] == 320
         assert v_stream["height"] == 240
+    finally:
+        controller.shutdown()
+
+
+def test_hotkey_and_output_dir_change_with_rollback_and_persistence(tmp_path: Path) -> None:
+    class _FailableHotkeyListener(_StubHotkeyListener):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_on: set[str] = set()
+
+        def register(self, hotkey: str, callback: Callable[[], None]) -> None:
+            if hotkey in self.fail_on:
+                raise RuntimeError(f"hotkey {hotkey} busy")
+            super().register(hotkey, callback)
+
+    settings_file = tmp_path / "settings.json"
+    initial_out = tmp_path / "out_initial"
+    new_out = tmp_path / "out_custom"
+    hotkey_stub = _FailableHotkeyListener()
+    hotkey_stub.fail_on.add("F10")
+
+    config = AppConfig(
+        capture=CaptureConfig(temp_dir=tmp_path / "temp", hotkey="F9", fps=30),
+        output_dir=initial_out,
+    )
+    controller = QuickClipController(
+        config=config,
+        hotkey_listener=hotkey_stub,
+        grabber_factory=lambda _cfg: _SyntheticGrabber(width=320, height=180),
+        enable_tray=False,
+        quit_on_exit=False,
+        settings_path=settings_file,
+        persist_settings=True,
+    )
+    try:
+        hotkey_stub.register("F9", controller._on_hotkey_callback)
+
+        # Successful hotkey change persists to settings.json.
+        assert controller.change_hotkey("F8") is True
+        assert config.capture.hotkey == "F8"
+        assert hotkey_stub.hotkey == "F8"
+        assert controller.standby_window.hotkey_label.text() == "F8"
+
+        # Failed hotkey change rolls back cleanly to F8.
+        assert controller.change_hotkey("F10") is False
+        assert config.capture.hotkey == "F8"
+        assert hotkey_stub.hotkey == "F8"
+        assert controller.standby_window.hotkey_label.text() == "F8"
+
+        # Output folder change creates/updates directory and persists.
+        assert controller.set_output_dir(new_out) is True
+        assert config.output_dir == new_out
+        assert new_out.is_dir()
+        assert str(new_out) in controller.standby_window.output_dir_label.text()
+
+        controller.set_region_mode(True)
+        loaded = load_user_settings(settings_file)
+        assert loaded == UserSettings(
+            hotkey="F8",
+            output_dir=str(new_out),
+            monitor_index=config.capture.monitor_index,
+            region_mode=True,
+        )
+
+        # CLI build_app_config applies saved settings and honors explicit overrides.
+        parser = build_parser()
+        from_saved = build_app_config(parser.parse_args([]), saved_settings=loaded)
+        assert from_saved.capture.hotkey == "F8"
+        assert from_saved.output_dir == new_out
+
+        overridden = build_app_config(
+            parser.parse_args(["--hotkey", "F7", "--output-dir", str(initial_out)]),
+            saved_settings=loaded,
+        )
+        assert overridden.capture.hotkey == "F7"
+        assert overridden.output_dir == initial_out
+    finally:
+        controller.shutdown()
+
+
+def test_region_selection_capture_and_cancel_end_to_end(qtbot, tmp_path: Path) -> None:
+    from PySide6.QtCore import QObject, QRect, Signal
+
+    class _FakeOverlay(QObject):
+        regionSelected = Signal(CaptureRegion)
+        selectionCancelled = Signal()
+
+        def __init__(self, monitor: MonitorInfo, screen_geometry: QRect | None) -> None:
+            super().__init__()
+            self.monitor = monitor
+            self.screen_geometry = screen_geometry
+            self.started = False
+            self.hidden = False
+
+        def start_selection(self) -> None:
+            self.started = True
+
+        def cancel_selection(self) -> None:
+            self.hidden = True
+            self.selectionCancelled.emit()
+
+        def hide(self) -> None:
+            self.hidden = True
+
+    overlays: list[_FakeOverlay] = []
+
+    def _overlay_factory(mon: MonitorInfo, rect: QRect | None) -> _FakeOverlay:
+        ov = _FakeOverlay(mon, rect)
+        overlays.append(ov)
+        return ov
+
+    def _grabber_for_cfg(cfg: CaptureConfig) -> _SyntheticGrabber:
+        if cfg.capture_region is not None:
+            return _SyntheticGrabber(
+                width=cfg.capture_region.width,
+                height=cfg.capture_region.height,
+            )
+        return _SyntheticGrabber(width=640, height=360)
+
+    out_dir = tmp_path / "exports"
+    config = AppConfig(
+        capture=CaptureConfig(
+            temp_dir=tmp_path / "temp",
+            fps=30,
+            keyframe_interval_sec=0.5,
+            prefer_hardware_encoder=False,
+        ),
+        output_dir=out_dir,
+    )
+    fake_monitors = [
+        MonitorInfo(index=1, name="Main", width=1920, height=1080, left=0, top=0, is_primary=True),
+    ]
+    controller = QuickClipController(
+        config=config,
+        hotkey_listener=_StubHotkeyListener(),
+        grabber_factory=_grabber_for_cfg,
+        monitors_fn=lambda: fake_monitors,
+        region_mode=True,
+        region_selector_factory=_overlay_factory,
+        enable_tray=False,
+        auto_close_ms=0,
+        quit_on_exit=False,
+    )
+    captures: list[CaptureResult] = []
+    exports: list[TrimResult] = []
+    controller.captureFinished.connect(captures.append)
+    controller.exportFinished.connect(exports.append)
+
+    try:
+        controller.start(show_standby=True)
+        qtbot.waitUntil(
+            lambda: controller.capture_engine.state == CaptureState.STANDBY
+            and controller.standby_window.state == CaptureState.STANDBY,
+            timeout=15000,
+        )
+        assert controller.standby_window.is_region_mode() is True
+        assert controller.standby_window.record_button.text() == "Alan Seç & Kaydet"
+
+        # 1. Start recording opens overlay; cancelling restores StandbyWindow without capturing.
+        controller.toggle_recording()
+        assert len(overlays) == 1 and overlays[0].started is True
+        assert not controller.standby_window.isVisible()
+        overlays[0].cancel_selection()
+        assert controller.standby_window.isVisible()
+        assert controller.capture_engine.state == CaptureState.STANDBY
+        assert captures == []
+
+        # 2. Start quick 1.0s clip -> select a 320x180 region -> record & export 320x180 MP4.
+        controller.start_quick_clip(1.0)
+        assert len(overlays) == 2 and overlays[1].started is True
+        chosen_region = CaptureRegion(left=200, top=120, width=320, height=180, monitor_index=1)
+        overlays[1].regionSelected.emit(chosen_region)
+
+        qtbot.waitUntil(lambda: len(captures) == 1, timeout=15000)
+        cap_res = captures[0]
+        assert cap_res.is_valid is True
+        assert cap_res.width == 320
+        assert cap_res.height == 180
+
+        trimmer = controller.trimmer_window
+        assert trimmer is not None
+        trimmer.direct_save_button.click()
+        qtbot.waitUntil(lambda: len(exports) == 1, timeout=15000)
+
+        trim_res = exports[0]
+        assert trim_res.success is True and trim_res.output_path is not None
+        assert trim_res.source_cleaned is True
+        probed = _probe_mp4(trim_res.output_path)
+        v_stream = next(s for s in probed["streams"] if s["codec_type"] == "video")
+        assert v_stream["width"] == 320
+        assert v_stream["height"] == 180
+
+        # After export completes, capture_region clears and Warm Standby re-arms full-screen.
+        qtbot.waitUntil(
+            lambda: controller.capture_engine.state == CaptureState.STANDBY
+            and controller.capture_engine.capture_size == (640, 360),
+            timeout=15000,
+        )
+        assert config.capture.capture_region is None
     finally:
         controller.shutdown()

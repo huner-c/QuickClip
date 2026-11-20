@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 from quickclip.capture.audio import resolve_audio_input
 from quickclip.capture.monitors import resolve_monitor_rect
-from quickclip.contracts import CaptureConfig, CaptureResult, CaptureState
+from quickclip.contracts import CaptureConfig, CaptureRegion, CaptureResult, CaptureState
 from quickclip.paths import resolve_ffmpeg_path, resolve_ffprobe_path
 
 logger = logging.getLogger(__name__)
@@ -155,6 +155,7 @@ class _DXCamGrabber:
         self,
         monitor_index: int,
         target_rect: tuple[int, int, int, int] | None = None,
+        region: CaptureRegion | None = None,
     ) -> None:
         if monitor_index < 1:
             raise ValueError("DXCam requires monitor_index >= 1.")
@@ -172,15 +173,27 @@ class _DXCamGrabber:
             monitor_index=monitor_index,
             target_rect=target_rect,
         )
+        dxcam_region: tuple[int, int, int, int] | None = None
+        if region is not None:
+            mon_w = target_rect[2] if target_rect is not None else region.right
+            mon_h = target_rect[3] if target_rect is not None else region.bottom
+            norm = region.normalized(mon_w, mon_h)
+            dxcam_region = (norm.left, norm.top, norm.right, norm.bottom)
+
         cam = dxcam.create(
             device_idx=device_idx,
             output_idx=output_idx,
+            region=dxcam_region,
             output_color="BGRA",
             processor_backend="numpy",
         )
         self._cam = cam
-        self._width = int(cam.width)
-        self._height = int(cam.height)
+        if dxcam_region is not None:
+            self._width = int(dxcam_region[2] - dxcam_region[0])
+            self._height = int(dxcam_region[3] - dxcam_region[1])
+        else:
+            self._width = int(cam.width)
+            self._height = int(cam.height)
 
         # Verify that DuplicateOutput frame acquisition actually works in this desktop session.
         try:
@@ -296,7 +309,11 @@ class _DXCamGrabber:
 class _MSSGrabber:
     """Fallback GDI screen grabber backed by ``mss.MSS``."""
 
-    def __init__(self, monitor_index: int) -> None:
+    def __init__(
+        self,
+        monitor_index: int,
+        region: CaptureRegion | None = None,
+    ) -> None:
         import mss
 
         self._mss_mod = mss
@@ -323,18 +340,32 @@ class _MSSGrabber:
                 )
                 chosen = dict(monitors[fallback_idx])
 
-            self._monitor = {
-                "left": int(chosen["left"]),
-                "top": int(chosen["top"]),
-                "width": int(chosen["width"]),
-                "height": int(chosen["height"]),
-            }
+            base_left = int(chosen["left"])
+            base_top = int(chosen["top"])
+            base_width = int(chosen["width"])
+            base_height = int(chosen["height"])
+            if base_width <= 0 or base_height <= 0:
+                raise RuntimeError(
+                    f"Invalid monitor dimensions: {base_width}x{base_height}"
+                )
+
+            if region is not None:
+                norm = region.normalized(base_width, base_height)
+                self._monitor = {
+                    "left": base_left + norm.left,
+                    "top": base_top + norm.top,
+                    "width": norm.width,
+                    "height": norm.height,
+                }
+            else:
+                self._monitor = {
+                    "left": base_left,
+                    "top": base_top,
+                    "width": base_width,
+                    "height": base_height,
+                }
             self._width = self._monitor["width"]
             self._height = self._monitor["height"]
-            if self._width <= 0 or self._height <= 0:
-                raise RuntimeError(
-                    f"Invalid monitor dimensions: {self._width}x{self._height}"
-                )
 
             # Seed an initial frame if BitBlt is permitted on the current desktop.
             self._seed_frame: bytes | None = None
@@ -417,7 +448,11 @@ def _create_default_grabber(config: CaptureConfig) -> tuple[ScreenGrabber, bytes
     if config.monitor_index >= 1:
         target_rect = resolve_monitor_rect(config.monitor_index)
         try:
-            dxcam_grabber = _DXCamGrabber(config.monitor_index, target_rect=target_rect)
+            dxcam_grabber = _DXCamGrabber(
+                config.monitor_index,
+                target_rect=target_rect,
+                region=config.capture_region,
+            )
             seed: bytes | None = None
             first = dxcam_grabber.grab()
             if first is not None:
@@ -426,7 +461,7 @@ def _create_default_grabber(config: CaptureConfig) -> tuple[ScreenGrabber, bytes
         except Exception as exc:
             logger.info("DXCam unavailable (%s); falling back to MSS.", exc)
 
-    mss_grabber = _MSSGrabber(config.monitor_index)
+    mss_grabber = _MSSGrabber(config.monitor_index, region=config.capture_region)
     return mss_grabber, mss_grabber.seed_frame
 
 
@@ -480,7 +515,9 @@ class CaptureEngine:
         self._encoder_used: str | None = None
         self._grabber: ScreenGrabber | None = None
         self._grabber_monitor_index: int | None = None
+        self._grabber_region: CaptureRegion | None = None
         self._warmed_monitor_index: int | None = None
+        self._warmed_region: CaptureRegion | None = None
         self._seed_frame: bytes | None = None
         self._capture_size: tuple[int, int] | None = None
         self._has_audio: bool = False
@@ -570,6 +607,7 @@ class CaptureEngine:
                     self._proc is not None
                     and self._proc.poll() is None
                     and self._warmed_monitor_index == self._config.monitor_index
+                    and self._warmed_region == self._config.capture_region
                     and not self._shutdown_requested.is_set()
                 ):
                     return
@@ -579,6 +617,7 @@ class CaptureEngine:
                 )
             self._state = CaptureState.WARMING
             self._warmed_monitor_index = None
+            self._warmed_region = None
             self._shutdown_requested.clear()
             self._warm_done_event.clear()
             self._last_result = None
@@ -591,7 +630,10 @@ class CaptureEngine:
             self._encoder_used = encoder
             self._check_not_shutting_down()
 
-            if self._grabber is not None and self._grabber_monitor_index != self._config.monitor_index:
+            if self._grabber is not None and (
+                self._grabber_monitor_index != self._config.monitor_index
+                or self._grabber_region != self._config.capture_region
+            ):
                 self._release_grabber()
 
             if self._grabber is None:
@@ -603,6 +645,7 @@ class CaptureEngine:
                     grabber, seed = _create_default_grabber(self._config)
                 self._grabber = grabber
                 self._grabber_monitor_index = self._config.monitor_index
+                self._grabber_region = self._config.capture_region
             else:
                 grabber = self._grabber
                 try:
@@ -617,6 +660,16 @@ class CaptureEngine:
             height = int(grabber.height)
             if width <= 0 or height <= 0:
                 raise RuntimeError(f"Invalid grabber frame dimensions: {width}x{height}")
+
+            effective_encoder = encoder
+            if effective_encoder in HARDWARE_ENCODERS and (width < 128 or height < 128):
+                logger.info(
+                    "Capture dimensions %dx%d below hardware encoder minimum (128x128); using libx264.",
+                    width,
+                    height,
+                )
+                effective_encoder = "libx264"
+            self._encoder_used = effective_encoder
 
             expected_len = width * height * 4
             if seed is not None and len(seed) == expected_len:
@@ -639,7 +692,7 @@ class CaptureEngine:
             cmd = self._build_standby_command(
                 width=width,
                 height=height,
-                encoder=encoder,
+                encoder=effective_encoder,
                 audio_spec=audio_spec,
             )
 
@@ -676,6 +729,7 @@ class CaptureEngine:
             with self._state_lock:
                 self._check_not_shutting_down()
                 self._warmed_monitor_index = self._config.monitor_index
+                self._warmed_region = self._config.capture_region
                 self._state = CaptureState.STANDBY
         except _WarmupAbortedError:
             self._terminate_standby_process(remove_incomplete=True)
@@ -762,9 +816,57 @@ class CaptureEngine:
                 )
             changed = self._config.monitor_index != target_index
             self._config.monitor_index = target_index
+            if changed:
+                self._config.capture_region = None
             if changed or self._grabber_monitor_index != target_index:
                 needs_reset = True
                 self._warmed_monitor_index = None
+                self._warmed_region = None
+                if self._state == CaptureState.STANDBY:
+                    self._state = CaptureState.COLD
+
+        if needs_reset:
+            self._terminate_standby_process(remove_incomplete=True)
+            self._release_grabber()
+            self._capture_size = None
+
+        if rewarm:
+            self.warm_up()
+
+    def set_capture_region(
+        self,
+        region: CaptureRegion | None,
+        *,
+        rewarm: bool = False,
+    ) -> None:
+        """Configure or clear a monitor-relative ``CaptureRegion`` when idle/standby."""
+        needs_reset = False
+        with self._state_lock:
+            if self._state in (
+                CaptureState.WARMING,
+                CaptureState.RECORDING,
+                CaptureState.STOPPING,
+            ):
+                raise RuntimeError(
+                    f"Cannot change capture region while engine is in state {self._state.value}."
+                )
+            target_monitor = (
+                int(region.monitor_index) if region is not None else self._config.monitor_index
+            )
+            changed = (
+                self._config.capture_region != region
+                or self._config.monitor_index != target_monitor
+            )
+            self._config.monitor_index = target_monitor
+            self._config.capture_region = region
+            if (
+                changed
+                or self._grabber_region != region
+                or self._grabber_monitor_index != target_monitor
+            ):
+                needs_reset = True
+                self._warmed_monitor_index = None
+                self._warmed_region = None
                 if self._state == CaptureState.STANDBY:
                     self._state = CaptureState.COLD
 
@@ -808,6 +910,7 @@ class CaptureEngine:
 
         with self._state_lock:
             self._warmed_monitor_index = None
+            self._warmed_region = None
             self._state = CaptureState.COLD
 
     def _on_auto_stop_timer(self) -> None:
@@ -1150,6 +1253,7 @@ class CaptureEngine:
         grabber = self._grabber
         self._grabber = None
         self._grabber_monitor_index = None
+        self._grabber_region = None
         self._seed_frame = None
         if grabber is not None:
             try:

@@ -58,6 +58,64 @@ class MonitorInfo:
         return f"{prefix} ({suffix})"
 
 
+@dataclass(frozen=True)
+class CaptureRegion:
+    """Monitor-relative capture rectangle in physical pixels."""
+
+    left: int
+    top: int
+    width: int
+    height: int
+    monitor_index: int = 1
+
+    def __post_init__(self) -> None:
+        if self.left < 0 or self.top < 0:
+            raise ValueError(
+                f"CaptureRegion origin must be non-negative, got ({self.left}, {self.top})"
+            )
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(
+                f"CaptureRegion dimensions must be positive, got {self.width}x{self.height}"
+            )
+        if self.monitor_index < 0:
+            raise ValueError(
+                f"CaptureRegion monitor_index must be >= 0, got {self.monitor_index}"
+            )
+
+    @property
+    def right(self) -> int:
+        """Return monitor-relative right edge in physical pixels."""
+        return self.left + self.width
+
+    @property
+    def bottom(self) -> int:
+        """Return monitor-relative bottom edge in physical pixels."""
+        return self.top + self.height
+
+    def normalized(self, monitor_width: int, monitor_height: int) -> CaptureRegion:
+        """Clamp region within monitor bounds with even width/height for H.264."""
+        if monitor_width < 2 or monitor_height < 2:
+            raise ValueError(
+                f"Invalid monitor dimensions for normalization: {monitor_width}x{monitor_height}"
+            )
+        left = max(0, min(int(self.left), monitor_width - 2))
+        top = max(0, min(int(self.top), monitor_height - 2))
+        max_w = monitor_width - left
+        max_h = monitor_height - top
+        width = max(2, min(int(self.width), max_w))
+        height = max(2, min(int(self.height), max_h))
+        # Ensure even dimensions for yuv420p H.264 compatibility.
+        width = max(2, (width // 2) * 2)
+        height = max(2, (height // 2) * 2)
+        return CaptureRegion(
+            left=left,
+            top=top,
+            width=width,
+            height=height,
+            monitor_index=self.monitor_index,
+        )
+
+
 @dataclass
 class CaptureConfig:
     """Configuration options controlling capture and pre-warming behavior."""
@@ -71,6 +129,7 @@ class CaptureConfig:
     prefer_hardware_encoder: bool = True
     keyframe_interval_sec: float = 0.5
     monitor_index: int = 1
+    capture_region: CaptureRegion | None = None
     auto_stop_seconds: float | None = None
 
     def __post_init__(self) -> None:
@@ -243,6 +302,7 @@ class IHotkeyListener(Protocol):
 __all__ = [
     "AppConfig",
     "CaptureConfig",
+    "CaptureRegion",
     "CaptureResult",
     "CaptureState",
     "ICaptureEngine",

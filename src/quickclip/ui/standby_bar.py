@@ -7,10 +7,11 @@ from pathlib import Path
 import time
 
 from PySide6.QtCore import QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QKeyEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -155,7 +156,107 @@ QPushButton#refreshMonitorsButton {
     min-width: 28px;
     max-width: 28px;
 }
+QPushButton.compactButton {
+    padding: 3px 9px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 5px;
+}
+QPushButton#changeHotkeyButton:checked {
+    background-color: #1e3a5f;
+    border-color: #3b82f6;
+    color: #93c5fd;
+}
+QPushButton.modeButton {
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: 5px;
+}
+QPushButton.modeButton:checked {
+    background-color: #1e3a5f;
+    border-color: #3b82f6;
+    color: #dbeafe;
+}
 """
+
+_QT_SPECIAL_KEYS: dict[int, str] = {
+    int(Qt.Key.Key_Space): "Space",
+    int(Qt.Key.Key_Insert): "Insert",
+    int(Qt.Key.Key_Delete): "Delete",
+    int(Qt.Key.Key_Home): "Home",
+    int(Qt.Key.Key_End): "End",
+    int(Qt.Key.Key_PageUp): "PageUp",
+    int(Qt.Key.Key_PageDown): "PageDown",
+    int(Qt.Key.Key_Pause): "Pause",
+    int(Qt.Key.Key_Print): "PrintScreen",
+    int(Qt.Key.Key_Up): "Up",
+    int(Qt.Key.Key_Down): "Down",
+    int(Qt.Key.Key_Left): "Left",
+    int(Qt.Key.Key_Right): "Right",
+    int(Qt.Key.Key_Tab): "Tab",
+    int(Qt.Key.Key_Backspace): "Backspace",
+    int(Qt.Key.Key_Return): "Enter",
+    int(Qt.Key.Key_Enter): "Enter",
+}
+for _f_idx in range(1, 25):
+    _QT_SPECIAL_KEYS[int(Qt.Key.Key_F1) + (_f_idx - 1)] = f"F{_f_idx}"
+
+_MODIFIER_ONLY_KEYS: frozenset[int] = frozenset(
+    {
+        int(Qt.Key.Key_Control),
+        int(Qt.Key.Key_Shift),
+        int(Qt.Key.Key_Alt),
+        int(Qt.Key.Key_AltGr),
+        int(Qt.Key.Key_Meta),
+        int(Qt.Key.Key_Super_L),
+        int(Qt.Key.Key_Super_R),
+        int(Qt.Key.Key_unknown),
+        0,
+    }
+)
+_BARE_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {*(f"F{i}" for i in range(1, 25)), "Pause", "Insert", "PrintScreen"}
+)
+
+
+def qt_key_event_to_hotkey(
+    key: int,
+    modifiers: Qt.KeyboardModifier,
+) -> str | None:
+    """Convert a Qt key + modifiers pair into a canonical QuickClip hotkey string.
+
+    Returns ``None`` for modifier-only presses, Escape, unsupported keys, or
+    alphanumeric keys pressed without any modifier.
+    """
+    key_int = int(key)
+    if key_int in _MODIFIER_ONLY_KEYS or key_int == int(Qt.Key.Key_Escape):
+        return None
+
+    key_name: str | None = _QT_SPECIAL_KEYS.get(key_int)
+    if key_name is None:
+        if int(Qt.Key.Key_A) <= key_int <= int(Qt.Key.Key_Z):
+            key_name = chr(key_int)
+        elif int(Qt.Key.Key_0) <= key_int <= int(Qt.Key.Key_9):
+            key_name = chr(key_int)
+        else:
+            return None
+
+    parts: list[str] = []
+    if modifiers & Qt.KeyboardModifier.ControlModifier:
+        parts.append("Ctrl")
+    if modifiers & Qt.KeyboardModifier.AltModifier:
+        parts.append("Alt")
+    if modifiers & Qt.KeyboardModifier.ShiftModifier:
+        parts.append("Shift")
+    if modifiers & Qt.KeyboardModifier.MetaModifier:
+        parts.append("Win")
+
+    if not parts and key_name not in _BARE_ALLOWED_KEYS:
+        return None
+
+    parts.append(key_name)
+    return "+".join(parts)
 
 
 def _build_tray_icon(dot_color: str, *, base_icon: QIcon | None = None) -> QIcon:
@@ -212,6 +313,9 @@ class StandbyWindow(QMainWindow):
     quickClipRequested = Signal(float)
     monitorChanged = Signal(int)
     monitorRefreshRequested = Signal()
+    hotkeyChanged = Signal(str)
+    outputDirChanged = Signal(Path)
+    captureModeChanged = Signal(bool)
     startupToggled = Signal(bool)
     quitRequested = Signal()
 
@@ -228,12 +332,14 @@ class StandbyWindow(QMainWindow):
         self._output_dir: Path = Path(output_dir) if output_dir is not None else AppConfig().output_dir
         self._record_started_monotonic: float | None = None
         self._quitting: bool = False
+        self._capturing_hotkey: bool = False
+        self._region_mode: bool = False
 
         self.setWindowTitle("QuickClip — Warm Standby")
         app_icon = load_app_icon()
         if not app_icon.isNull():
             self.setWindowIcon(app_icon)
-        self.setFixedWidth(460)
+        self.setFixedWidth(480)
         self.setStyleSheet(_STANDBY_STYLESHEET)
 
         self._elapsed_timer = QTimer(self)
@@ -296,7 +402,7 @@ class StandbyWindow(QMainWindow):
 
         # Hotkey + Encoder info row.
         meta_row = QHBoxLayout()
-        meta_row.setSpacing(8)
+        meta_row.setSpacing(6)
 
         hotkey_caption = QLabel("Kısayol:", root)
         hotkey_caption.setProperty("class", "metaKey")
@@ -305,6 +411,14 @@ class StandbyWindow(QMainWindow):
         self.hotkey_label = QLabel(self._hotkey, root)
         self.hotkey_label.setObjectName("hotkeyBadge")
         meta_row.addWidget(self.hotkey_label)
+
+        self.change_hotkey_button = QPushButton("Değiştir", root)
+        self.change_hotkey_button.setObjectName("changeHotkeyButton")
+        self.change_hotkey_button.setProperty("class", "compactButton")
+        self.change_hotkey_button.setCheckable(True)
+        self.change_hotkey_button.setToolTip("Yeni kısayol tuşu ata (İptal: Esc)")
+        self.change_hotkey_button.clicked.connect(self._on_change_hotkey_clicked)
+        meta_row.addWidget(self.change_hotkey_button)
 
         meta_row.addStretch(1)
 
@@ -335,11 +449,48 @@ class StandbyWindow(QMainWindow):
         monitor_row.addWidget(self.refresh_monitors_button, 0)
         card_layout.addLayout(monitor_row)
 
-        # Output directory label.
+        # Capture mode selector row (Full Screen vs Region Select).
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+
+        mode_caption = QLabel("Mod:", root)
+        mode_caption.setProperty("class", "metaKey")
+        mode_row.addWidget(mode_caption)
+
+        self.fullscreen_mode_button = QPushButton("Tam Ekran", root)
+        self.fullscreen_mode_button.setObjectName("fullscreenModeButton")
+        self.fullscreen_mode_button.setProperty("class", "modeButton")
+        self.fullscreen_mode_button.setCheckable(True)
+        self.fullscreen_mode_button.setChecked(True)
+        self.fullscreen_mode_button.toggled.connect(self._on_fullscreen_mode_toggled)
+        mode_row.addWidget(self.fullscreen_mode_button, 1)
+
+        self.region_mode_button = QPushButton("Bölge Seç", root)
+        self.region_mode_button.setObjectName("regionModeButton")
+        self.region_mode_button.setProperty("class", "modeButton")
+        self.region_mode_button.setCheckable(True)
+        self.region_mode_button.setChecked(False)
+        self.region_mode_button.setToolTip("Kaydı başlatınca ekranda istenen alanı sürükleyip seçin")
+        self.region_mode_button.toggled.connect(self._on_region_mode_toggled)
+        mode_row.addWidget(self.region_mode_button, 1)
+        card_layout.addLayout(mode_row)
+
+        # Output directory row with folder picker button.
+        output_row = QHBoxLayout()
+        output_row.setSpacing(6)
+
         self.output_dir_label = QLabel("", root)
         self.output_dir_label.setProperty("class", "metaKey")
         self.output_dir_label.setWordWrap(True)
-        card_layout.addWidget(self.output_dir_label)
+        output_row.addWidget(self.output_dir_label, 1)
+
+        self.change_output_dir_button = QPushButton("Klasör Seç", root)
+        self.change_output_dir_button.setObjectName("changeOutputDirButton")
+        self.change_output_dir_button.setProperty("class", "compactButton")
+        self.change_output_dir_button.setToolTip("Videoların kaydedileceği klasörü değiştir")
+        self.change_output_dir_button.clicked.connect(self.choose_output_dir)
+        output_row.addWidget(self.change_output_dir_button, 0)
+        card_layout.addLayout(output_row)
 
         layout.addWidget(status_card)
 
@@ -457,7 +608,9 @@ class StandbyWindow(QMainWindow):
             self.record_button.setEnabled(True)
             self.quick_clip_button.setEnabled(False)
         else:
-            self.record_button.setText("Kaydı Başlat")
+            self.record_button.setText(
+                "Alan Seç & Kaydet" if self._region_mode else "Kaydı Başlat"
+            )
             self.record_button.setEnabled(True)
             self.quick_clip_button.setEnabled(True)
 
@@ -465,13 +618,19 @@ class StandbyWindow(QMainWindow):
         self.record_button.style().unpolish(self.record_button)
         self.record_button.style().polish(self.record_button)
 
-        can_change_monitor = resolved not in (
+        can_change_settings = resolved not in (
             CaptureState.WARMING,
             CaptureState.RECORDING,
             CaptureState.STOPPING,
         )
-        self.monitor_combo.setEnabled(can_change_monitor)
-        self.refresh_monitors_button.setEnabled(can_change_monitor)
+        if not can_change_settings and self._capturing_hotkey:
+            self._cancel_hotkey_capture()
+        self.monitor_combo.setEnabled(can_change_settings)
+        self.refresh_monitors_button.setEnabled(can_change_settings)
+        self.change_hotkey_button.setEnabled(can_change_settings)
+        self.change_output_dir_button.setEnabled(can_change_settings)
+        self.fullscreen_mode_button.setEnabled(can_change_settings)
+        self.region_mode_button.setEnabled(can_change_settings)
 
         # Tray visual feedback.
         if self._tray_icon is not None:
@@ -554,6 +713,99 @@ class StandbyWindow(QMainWindow):
         """Return the currently selected 1-based monitor index."""
         data = self.monitor_combo.currentData()
         return int(data) if data is not None else 1
+
+    def is_region_mode(self) -> bool:
+        """Return True when capture mode is set to interactive region selection."""
+        return self._region_mode
+
+    @Slot(bool)
+    def set_region_mode(self, enabled: bool) -> None:
+        """Sync Full Screen / Region mode buttons without emitting ``captureModeChanged``."""
+        flag = bool(enabled)
+        self._region_mode = flag
+        with QSignalBlocker(self.fullscreen_mode_button):
+            self.fullscreen_mode_button.setChecked(not flag)
+        with QSignalBlocker(self.region_mode_button):
+            self.region_mode_button.setChecked(flag)
+        if self._state not in (CaptureState.WARMING, CaptureState.RECORDING, CaptureState.STOPPING):
+            self.record_button.setText("Alan Seç & Kaydet" if flag else "Kaydı Başlat")
+
+    def is_capturing_hotkey(self) -> bool:
+        """Return True while waiting for the user to press a new hotkey."""
+        return self._capturing_hotkey
+
+    def _cancel_hotkey_capture(self) -> None:
+        self._capturing_hotkey = False
+        with QSignalBlocker(self.change_hotkey_button):
+            self.change_hotkey_button.setChecked(False)
+        self.change_hotkey_button.setText("Değiştir")
+
+    @Slot(bool)
+    def _on_change_hotkey_clicked(self, checked: bool) -> None:
+        if checked:
+            self._capturing_hotkey = True
+            self.change_hotkey_button.setText("Tuşa basın...")
+            self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+            self.set_status_message("Yeni kısayol tuşuna basın (F1-F12 veya Ctrl/Alt+Tuş • Esc: İptal)")
+        else:
+            self._cancel_hotkey_capture()
+            self.set_status_message(f"Kısayol değişikliği iptal edildi ({self._hotkey}).")
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        """Capture a new global hotkey while hotkey-edit mode is active."""
+        if self._capturing_hotkey:
+            if event.key() == Qt.Key.Key_Escape:
+                self._cancel_hotkey_capture()
+                self.set_status_message(f"Kısayol değişikliği iptal edildi ({self._hotkey}).")
+                event.accept()
+                return
+            hotkey = qt_key_event_to_hotkey(event.key(), event.modifiers())
+            if hotkey is not None:
+                self._cancel_hotkey_capture()
+                self.hotkeyChanged.emit(hotkey)
+            else:
+                if int(event.key()) not in _MODIFIER_ONLY_KEYS:
+                    self.set_status_message(
+                        "Geçersiz tuş — F1-F12 veya Ctrl/Alt/Shift kombinasyonu seçin (Esc: İptal)"
+                    )
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    @Slot()
+    def choose_output_dir(self) -> None:
+        """Open a folder dialog and emit ``outputDirChanged`` if a folder is selected."""
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Kayıt Klasörü Seç",
+            str(self._output_dir),
+        )
+        if chosen:
+            new_path = Path(chosen)
+            self.set_output_dir(new_path)
+            self.outputDirChanged.emit(new_path)
+
+    @Slot(bool)
+    def _on_fullscreen_mode_toggled(self, checked: bool) -> None:
+        if checked:
+            self._on_mode_button_clicked(False)
+        elif not self._region_mode:
+            with QSignalBlocker(self.fullscreen_mode_button):
+                self.fullscreen_mode_button.setChecked(True)
+
+    @Slot(bool)
+    def _on_region_mode_toggled(self, checked: bool) -> None:
+        if checked:
+            self._on_mode_button_clicked(True)
+        elif self._region_mode:
+            with QSignalBlocker(self.region_mode_button):
+                self.region_mode_button.setChecked(True)
+
+    def _on_mode_button_clicked(self, region_enabled: bool) -> None:
+        prev = self._region_mode
+        self.set_region_mode(region_enabled)
+        if region_enabled != prev:
+            self.captureModeChanged.emit(region_enabled)
 
     @Slot(int)
     def _on_monitor_combo_changed(self, combo_index: int) -> None:
